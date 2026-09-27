@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#FFFBF5">
+<title>控笔小游戏</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #FFFBF5;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    overscroll-behavior: none;
+    position: fixed; inset: 0;
+  }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+     0. 基础环境
+     ============================================================ */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  let W = 0, H = 0, DPR = 1;
+
+  const CFG = {
+    completeRatio: 0.75,   // 覆盖率达到 75% 算完成
+    hintDelay: 3500,       // 停笔 3.5 秒后出现引导
+    celebrateMs: 2400,     // 庆祝动画时长
+    appearMs: 400          // 新图形淡入时长
+  };
+
+  const state = {
+    shapeIndex: -1,
+    shape: null,          // { name, color, points:[{x,y,covered}], lineWidth }
+    tol: 60,              // 判定容差半径（像素）
+    progress: 0,
+    coveredCount: 0,
+    totalCount: 0,
+    status: 'drawing',    // 'drawing' | 'celebrating'
+    strokes: [],          // 用户笔迹
+    currentStroke: null,
+    particles: [],
+    lastProgressAt: 0,
+    lastTouchAt: 0,
+    celebrateAt: 0,
+    shapeShownAt: 0
+  };
+
+  /* ============================================================
+     1. 画布尺寸
+     ============================================================ */
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth;
+    H = window.innerHeight;
+
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // 关键：每帧都用逻辑坐标绘制，这里统一缩放
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // 尺寸变了要重新生成当前图形
+    if (state.shapeIndex >= 0) loadShape(state.shapeIndex);
+  }
+
+  /* ============================================================
+     2. 图形模板（归一化坐标，绘制时按画布尺寸换算）
+     ============================================================ */
+
+  // 直线采样
+  function sampleLine(x1, y1, x2, y2, gap) {
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    const n = Math.max(2, Math.round(len / gap));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      pts.push({ x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t, covered: false });
+    }
+    return pts;
+  }
+
+  // 圆采样
+  function sampleCircle(cx, cy, r, gap) {
+    const len = 2 * Math.PI * r;
+    const n = Math.max(12, Math.round(len / gap));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const a = -Math.PI / 2 + (i / n) * Math.PI * 2;
+      pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a), covered: false });
+    }
+    return pts;
+  }
+
+  // 折线（正方形、三角形）
+  function samplePolyline(corners, gap) {
+    const pts = [];
+    for (let s = 0; s < corners.length - 1; s++) {
+      const [x1, y1] = corners[s];
+      const [x2, y2] = corners[s + 1];
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      const n = Math.max(1, Math.round(len / gap));
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        pts.push({ x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t, covered: false });
+      }
+    }
+    const last = corners[corners.length - 1];
+    pts.push({ x: last[0], y: last[1], covered: false });
+    return pts;
+  }
+
+  // 波浪线
+  function sampleWave(cx, cy, S, gap) {
+    const width = 0.82 * S;
+    const amp = 0.13 * S;
+    const cycles = 3;
+    const n = Math.max(24, Math.round((width * 1.4) / gap));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      pts.push({
+        x: cx + (t - 0.5) * width,
+        y: cy + Math.sin(t * Math.PI * 2 * cycles) * amp,
+        covered: false
+      });
+    }
+    return pts;
+  }
+
+  // 图形清单：按难度从易到难
+  const SHAPES = [
+    {
+      name: '竖线', color: '#4D96FF',
+      build: (cx, cy, S, gap) => sampleLine(cx, cy - 0.38 * S, cx, cy + 0.38 * S, gap)
+    },
+    {
+      name: '横线', color: '#FF6B6B',
+      build: (cx, cy, S, gap) => sampleLine(cx - 0.38 * S, cy, cx + 0.38 * S, cy, gap)
+    },
+    {
+      name: '圆圈', color: '#FFB020',
+      build: (cx, cy, S, gap) => sampleCircle(cx, cy, 0.34 * S, gap)
+    },
+    {
+      name: '正方形', color: '#4CC38A',
+      build: (cx, cy, S, gap) => samplePolyline([
+        [cx - 0.30 * S, cy - 0.30 * S],
+        [cx + 0.30 * S, cy - 0.30 * S],
+        [cx + 0.30 * S, cy + 0.30 * S],
+        [cx - 0.30 * S, cy + 0.30 * S],
+        [cx - 0.30 * S, cy - 0.30 * S]
+      ], gap)
+    },
+    {
+      name: '波浪线', color: '#A66CFF',
+      build: (cx, cy, S, gap) => sampleWave(cx, cy, S, gap)
+    },
+    {
+      name: '三角形', color: '#FF6FB5',
+      build: (cx, cy, S, gap) => samplePolyline([
+        [cx, cy - 0.40 * S],
+        [cx + 0.38 * S, cy + 0.30 * S],
+        [cx - 0.38 * S, cy + 0.30 * S],
+        [cx, cy - 0.40 * S]
+      ], gap)
+    }
+  ];
+
+  /* ============================================================
+     3. 加载 / 切换图形
+     ============================================================ */
+  function loadShape(index) {
+    if (W === 0 || H === 0) return;
+
+    const S = Math.min(W, H) * 0.72;   // 图形占短边的 72%
+    const cx = W / 2;
+    const cy = H / 2;
+    const gap = Math.max(5, S * 0.012); // 采样点间距
+    const def = SHAPES[index];
+
+    const lineWidth = Math.max(18, S * 0.065); // 轨道粗细
+    const pts = def.build(cx, cy, S, gap);
+
+    state.shapeIndex = index;
+    state.shape = {
+      name: def.name,
+      color: def.color,
+      points: pts,
+      lineWidth: lineWidth
+    };
+
+    // 判定容差 ≈ 轨道宽度的 1.7 倍（对幼儿足够宽松）
+    state.tol = lineWidth * 1.7;
+
+    state.totalCount = pts.length;
+    state.coveredCount = 0;
+    state.progress = 0;
+    state.status = 'drawing';
+    state.strokes = [];
+    state.currentStroke = null;
+    state.celebrateAt = 0;
+
+    const now = performance.now();
+    state.lastProgressAt = now;
+    state.lastTouchAt = now;
+    state.shapeShownAt = now;
+  }
+
+  /* ============================================================
+     4. 核心：覆盖判定
+     ============================================================ */
+  function markCoveredAt(x, y) {
+    if (!state.shape || state.status !== 'drawing') return;
+
+    const pts = state.shape.points;
+    const tol2 = state.tol * state.tol;
+    let gained = 0;
+
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (p.covered) continue;
+      const dx = p.x - x;
+      const dy = p.y - y;
+      if (dx * dx + dy * dy <= tol2) {
+        p.covered = true;
+        gained++;
+      }
+    }
+
+    if (gained > 0) {
+      state.coveredCount += gained;
+      state.progress = state.coveredCount / state.totalCount;
+      state.lastProgressAt = performance.now();
+
+      if (state.progress >= CFG.completeRatio) {
+        onComplete();
+      }
+    }
+  }
+
+  /* ============================================================
+     5. 完成 → 奖励
+     ============================================================ */
+  function onComplete() {
+    if (state.status !== 'drawing') return;
+
+    state.status = 'celebrating';
+    state.celebrateAt = performance.now();
+
+    spawnConfetti();
+    playSuccessSound();
+
+    setTimeout(function () {
+      if (state.status === 'celebrating') {
+        nextShape();
+      }
+    }, CFG.celebrateMs);
+  }
+
+  function nextShape() {
+    const next = (state.shapeIndex + 1) % SHAPES.length;
+    loadShape(next);
+  }
+
+  /* ============================================================
+     6. 粒子（彩纸）
+     ============================================================ */
+  const CONFETTI_COLORS = ['#FF6B6B', '#FFD93D', '#6BCB77', '#4D96FF', '#FF6FB5', '#A66CFF', '#FF9F1C'];
+
+  function spawnConfetti() {
+    const count = 90;
+    for (let i = 0; i < count; i++) {
+      state.particles.push({
+        x: W / 2 + (Math.random() - 0.5) * W * 0.35,
+        y: H / 2 + (Math.random() - 0.5) * H * 0.25,
+        vx: (Math.random() - 0.5) * 700,
+        vy: -Math.random() * 900 - 200,
+        size: 12 + Math.random() * 16,
+        color: CONFETTI_COLORS[(Math.random() * CONFETTI_COLORS.length) | 0],
+        rot: Math.random() * Math.PI * 2,
+        vr: (Math.random() - 0.5) * 8,
+        life: 1
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      const p = state.particles[i];
+      p.vy += 1400 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+      p.life -= dt * 0.45;
+
+      if (p.life <= 0 || p.y > H + 120) {
+        state.particles.splice(i, 1);
+      }
+    }
+  }
+
+  function drawParticles() {
+    for (let i = 0; i < state.particles.length; i++) {
+      const p = state.particles[i];
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.62);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ============================================================
+     7. 音效（Web Audio 合成，不依赖外部文件）
+     ============================================================ */
+  let actx = null;
+
+  function initAudio() {
+    if (actx) {
+      if (actx.state === 'suspended') actx.resume().catch(function () {});
+      return;
+    }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) actx = new AC();
+    } catch (e) {
+      actx = null;
+    }
+  }
+
+  function tone(freq, delay, dur, vol, type) {
+    if (!actx) return;
+    const t0 = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
+
+  function playSuccessSound() {
+    // C5 - E5 - G5 - C6 上行琶音
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    for (let i = 0; i < notes.length; i++) {
+      tone(notes[i], i * 0.1, 0.42, 0.13, 'triangle');
+    }
+  }
+
+  /* ============================================================
+     8. 输入处理
+     ============================================================ */
+  let pointerId = null;
+  let lastPt = null;
+
+  function getPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  function onDown(e) {
+    if (pointerId !== null) return;           // 只跟随第一根手指
+    if (state.status !== 'drawing') return;   // 庆祝中不接受绘制
+    if (!state.shape) return;
+
+    initAudio();
+
+    pointerId = e.pointerId;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+
+    const p = getPos(e);
+    lastPt = p;
+
+    state.currentStroke = [p];
+    state.strokes.push(state.currentStroke);
+    state.lastTouchAt = performance.now();
+
+    markCoveredAt(p.x, p.y);
+    e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (e.pointerId !== pointerId) return;
+
+    const p = getPos(e);
+    const prev = lastPt;
+
+    const dist = Math.hypot(p.x - prev.x, p.y - prev.y);
+
+    if (dist > 0.5) {
+      // 沿线段细分，防止快速划动漏检
+      const step = Math.max(4, state.tol * 0.5);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        markCoveredAt(
+          prev.x + (p.x - prev.x) * t,
+          prev.y + (p.y - prev.y) * t
+        );
+      }
+
+      // 笔迹抽稀
+      if (dist > 3 && state.currentStroke) {
+        state.currentStroke.push(p);
+      }
+    }
+
+    lastPt = p;
+    state.lastTouchAt = performance.now();
+    e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (e.pointerId !== pointerId) return;
+    pointerId = null;
+    lastPt = null;
+    state.currentStroke = null;
+  }
+
+  canvas.addEventListener('pointerdown', onDown, { passive: false });
+  canvas.addEventListener('pointermove', onMove, { passive: false });
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  /* ============================================================
+     9. 绘制
+     ============================================================ */
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#FFFCF6');
+    g.addColorStop(1, '#EDF4FF');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // 模板轨道：整条浅灰底 + 已覆盖部分上色
+  function drawTemplate() {
+    const pts = state.shape.points;
+    if (pts.length < 2) return;
+
+    const L = state.shape.lineWidth;
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // 底轨
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.strokeStyle = '#DCE4F0';
+    ctx.lineWidth = L;
+    ctx.stroke();
+
+    // 已覆盖段上色
+    const n = pts.length;
+    let i = 0;
+    while (i < n - 1) {
+      if (!pts[i].covered) { i++; continue; }
+
+      let j = i;
+      while (j + 1 < n && pts[j + 1].covered) j++;
+
+      if (j === i) {
+        // 单个点，画个小圆
+        ctx.beginPath();
+        ctx.arc(pts[i].x, pts[i].y, L / 2, 0, Math.PI * 2);
+        ctx.fillStyle = state.shape.color;
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(pts[i].x, pts[i].y);
+        for (let k = i + 1; k <= j; k++) {
+          ctx.lineTo(pts[k].x, pts[k].y);
+        }
+        ctx.strokeStyle = state.shape.color;
+        ctx.lineWidth = L;
+        ctx.stroke();
+      }
+
+      i = j + 1;
+    }
+  }
+
+  // 用户笔迹
+  function drawStrokes() {
+    if (!state.strokes.length) return;
+
+    const lw = state.shape.lineWidth * 0.78;
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(255,168,66,0.32)';
+    ctx.fillStyle = 'rgba(255,168,66,0.32)';
+    ctx.lineWidth = lw;
+
+    for (let s = 0; s < state.strokes.length; s++) {
+      const stroke = state.strokes[s];
+      if (!stroke || stroke.length === 0) continue;
+
+      if (stroke.length === 1) {
+        ctx.beginPath();
+        ctx.arc(stroke[0].x, stroke[0].y, lw / 2, 0, Math.PI * 2);
+        ctx.fill();
+        continue;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(stroke[0].x, stroke[0].y);
+      for (let i = 1; i < stroke.length; i++) {
+        ctx.lineTo(stroke[i].x, stroke[i].y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // 辅助引导：停笔一段时间后，一个小光点沿路径跑一遍
+  function drawHintIfNeeded(now) {
+    const idle = now - state.lastProgressAt;
+    if (idle < CFG.hintDelay) return;
+
+    const pts = state.shape.points;
+    const cycle = 2800;
+    const t = ((idle - CFG.hintDelay) % cycle) / cycle;
+    const idx = Math.min(pts.length - 1, Math.floor(t * pts.length));
+    const p = pts[idx];
+    const L = state.shape.lineWidth;
+
+    // 拖尾
+    const trailLen = 14;
+    for (let k = 0; k < trailLen; k++) {
+      const i2 = idx - k;
+      if (i2 < 0) break;
+      const q = pts[i2];
+      const f = 1 - k / trailLen;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, L * 0.45 * f, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,196,0,' + (f * 0.45).toFixed(3) + ')';
+      ctx.fill();
+    }
+
+    // 光点
+    const pulse = 1 + 0.15 * Math.sin(now / 120);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, L * 0.68 * pulse, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,210,60,0.95)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, L * 0.34, 0, Math.PI * 2);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+  }
+
+  function easeOutBack(t) {
+    const c1 = 1.70158;
+    const c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  }
+
+  function drawCelebration(now) {
+    const elapsed = now - state.celebrateAt;
+    const t = Math.min(1, elapsed / 500);
+    const s = easeOutBack(t);
+
+    const fs = Math.min(W, H) * 0.13;
+
+    ctx.save();
+    ctx.translate(W / 2, H * 0.14);
+    ctx.scale(s, s);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + Math.round(fs) + 'px -apple-system, "PingFang SC", "Helvetica Neue", sans-serif';
+    ctx.lineJoin = 'round';
+
+    ctx.lineWidth = fs * 0.16;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.strokeText('太棒了！', 0, 0);
+
+    ctx.fillStyle = '#FF9F1C';
+    ctx.fillText('太棒了！', 0, 0);
+
+    ctx.restore();
+  }
+
+  /* ============================================================
+     10. 主循环
+     ============================================================ */
+  function render(now) {
+    ctx.clearRect(0, 0, W, H);
+    drawBackground();
+
+    if (state.shape) {
+      const appear = Math.min(1, (now - state.shapeShownAt) / CFG.appearMs);
+
+      ctx.save();
+      ctx.globalAlpha = appear;
+
+      drawTemplate();                    // 轨道
+      drawStrokes();                     // 手指笔迹
+
+      if (state.status === 'drawing') {
+        drawHintIfNeeded(now);
+      }
+
+      ctx.restore();
+    }
+
+    drawParticles();
+
+    if (state.status === 'celebrating') {
+      drawCelebration(now);
+    }
+  }
+
+  let lastFrame = performance.now();
+
+  function loop(now) {
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+
+    updateParticles(dt);
+    render(now);
+
+    requestAnimationFrame(loop);
+  }
+
+  /* ============================================================
+     11. 启动
+     ============================================================ */
+  let resizeTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 120);
+  });
+
+  window.addEventListener('orientationchange', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 300);
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && actx && actx.state === 'suspended') {
+      actx.resume().catch(function () {});
+    }
+  });
+
+  resize();        // 此时 shapeIndex 为 -1，不会加载图形
+  loadShape(0);    // 从第一个图形开始
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
